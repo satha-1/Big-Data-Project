@@ -98,13 +98,17 @@ You should see both `HIGH_SPEND` and `IMPOSSIBLE_TRAVEL`.
 ### Troubleshooting
 
 - **Kafka not ready / producer retries**: This is expected briefly on first boot. Wait ~30–60 seconds and watch `docker compose logs -f producer`.
-- **Spark job can’t read Kafka**:
+- **Spark job can't read Kafka**:
   - Ensure Kafka is healthy: `docker compose ps`
   - Check `spark-master` logs for connector download issues (it uses `--packages` at submit time).
   - If your network blocks Maven downloads, pre-pull dependencies or allow Maven Central access.
 - **Windows bind mount issues**:
   - Keep the repo under a path Docker Desktop can access.
   - If you see permission errors, move the repo into your WSL2 filesystem and run compose from there.
+
+### Technical Notes
+
+- **Spark Image**: Uses official `apache/spark:3.5.8-scala2.12-java17-python3-ubuntu` image (includes Java 17 and Python 3) to avoid Debian trixie openjdk-11 package availability issues. This image is pre-configured with Spark 3.5.8 and all required dependencies.
 
 ### Repo layout
 
