@@ -15,6 +15,7 @@ from pyspark.sql.functions import (
     window,
 )
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType
+from pyspark.sql import functions as F
 
 
 def get_env(name: str, default: str | None = None) -> str:
@@ -72,7 +73,6 @@ def main() -> None:
         raw_kafka.selectExpr("CAST(value AS STRING) AS json_str")
         .select(from_json(col("json_str"), schema).alias("t"))
         .select("t.*")
-        # Robust timestamp parsing: accept ISO8601 with 'Z' with/without milliseconds
         .withColumn(
             "event_time_ts",
             coalesce(
@@ -82,70 +82,81 @@ def main() -> None:
             ),
         )
         .dropna(subset=["event_time_ts"])
-        .drop("event_time")  # Drop original string column to avoid ambiguity
-        .withColumnRenamed("event_time_ts", "event_time")  # Rename timestamp to event_time
+        .drop("event_time")
+        .withColumnRenamed("event_time_ts", "event_time")
+        .select(
+            "txn_id",
+            "user_id",
+            "event_time",  # TimestampType
+            "merchant_category",
+            "amount",
+            "country",
+            "city",
+        )
     )
 
-    # Safeguard: ensure exactly one event_time column exists before watermark
-    # Select all columns explicitly to guarantee uniqueness (event_time is now TimestampType)
-    parsed = parsed.select(
-        "txn_id",
-        "user_id",
-        "event_time",  # TimestampType column (converted from string)
-        "merchant_category",
-        "amount",
-        "country",
-        "city",
-    )
-
-    # Event-time watermark + txn_id dedupe
+    # Base watermark + txn_id dedupe (streaming state is fine here)
     events = parsed.withWatermark("event_time", "15 minutes").dropDuplicates(["txn_id"])
 
-    # Rule A: HIGH_SPEND (amount > 5000)
+    # Rule A: HIGH_SPEND
     is_high_spend = col("amount") > lit(5000.0)
 
-    # Rule B: IMPOSSIBLE_TRAVEL
-    # 10-minute event-time window per user; if multiple distinct countries seen -> fraud
-    # Use approx_count_distinct (streaming-safe) instead of countDistinct
-    events_with_win = events.withColumn("win10m", window(col("event_time"), "10 minutes"))
+    # Rule B: IMPOSSIBLE_TRAVEL (10-min window; >1 distinct country)
+    # Extract window start/end as separate columns to avoid event-time column conflict
+    events_with_win = (
+        events.withColumn("win10m", window(col("event_time"), "10 minutes"))
+        .withColumn("win10m_start", col("win10m.start"))
+        .withColumn("win10m_end", col("win10m.end"))
+        .drop("win10m")  # Drop the window struct to avoid event-time conflict
+    )
+
+    # Add watermark using event_time to support append mode downstream
+    # The aggregation groups by window boundaries but uses event_time for watermark
     suspect_windows = (
-        events_with_win.groupBy(col("user_id"), col("win10m"))
+        events_with_win.withWatermark("event_time", "15 minutes")
+        .groupBy(col("user_id"), col("win10m_start"), col("win10m_end"))
         .agg(approx_count_distinct(col("country"), rsd=0.02).alias("distinct_countries"))
         .filter(col("distinct_countries") > lit(1))
-        .select(col("user_id").alias("sw_user_id"), col("win10m").alias("sw_win10m"))
+        .select(
+            col("user_id").alias("sw_user_id"),
+            col("win10m_start").alias("sw_win10m_start"),
+            col("win10m_end").alias("sw_win10m_end"),
+        )
     )
 
     flagged = (
         events_with_win.join(
             suspect_windows,
             (events_with_win.user_id == suspect_windows.sw_user_id)
-            & (events_with_win.win10m == suspect_windows.sw_win10m),
+            & (events_with_win.win10m_start == suspect_windows.sw_win10m_start)
+            & (events_with_win.win10m_end == suspect_windows.sw_win10m_end),
             how="left",
         )
         .withColumn("is_impossible_travel", col("sw_user_id").isNotNull())
-        .drop("sw_user_id", "sw_win10m")
+        .drop("sw_user_id", "sw_win10m_start", "sw_win10m_end")
     )
 
     fraud_high_spend = (
         flagged.filter(is_high_spend)
-        .drop("win10m")
+        .drop("win10m_start", "win10m_end")
         .withColumn("fraud_type", lit("HIGH_SPEND"))
         .withColumn("detected_at", current_timestamp())
     )
 
     fraud_impossible_travel = (
         flagged.filter(col("is_impossible_travel"))
-        .drop("win10m")
+        .drop("win10m_start", "win10m_end")
         .withColumn("fraud_type", lit("IMPOSSIBLE_TRAVEL"))
         .withColumn("detected_at", current_timestamp())
     )
 
-    fraud_events = (
-        fraud_high_spend.unionByName(fraud_impossible_travel)
-        .dropDuplicates(["txn_id", "fraud_type"])
-    )
+    # No streaming dropDuplicates here; we'll dedupe inside foreachBatch.
+    fraud_events = fraud_high_spend.unionByName(fraud_impossible_travel)
 
-    valid_events = flagged.filter(~is_high_spend & ~col("is_impossible_travel")).drop("win10m")
+    valid_events = (
+        flagged.filter(~is_high_spend & ~col("is_impossible_travel"))
+        .drop("win10m_start", "win10m_end")
+    )
 
     validated_out = (
         valid_events.withColumn("date", date_format(col("event_time"), "yyyy-MM-dd"))
@@ -153,8 +164,11 @@ def main() -> None:
     )
 
     def write_fraud_to_postgres(batch_df, batch_id: int) -> None:  # noqa: ANN001
+        # Batch dedupe (no streaming state)
+        deduped = batch_df.dropDuplicates(["txn_id", "fraud_type"])
+
         (
-            batch_df.select(
+            deduped.select(
                 "txn_id",
                 "user_id",
                 "event_time",
@@ -202,7 +216,7 @@ def main() -> None:
         events.groupBy(window(col("event_time"), "6 hours").alias("win6h"))
         .agg(
             fsum(col("amount")).alias("total_amount"),
-            col("amount").count().alias("txn_count"),
+            F.count("*").alias("txn_count"),
         )
         .select(
             col("win6h.start").alias("window_start"),
@@ -219,10 +233,8 @@ def main() -> None:
         .start()
     )
 
-    # Block forever while streams run
     spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":
     main()
-
