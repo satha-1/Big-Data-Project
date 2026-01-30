@@ -82,7 +82,20 @@ def main() -> None:
             ),
         )
         .dropna(subset=["event_time_ts"])
-        .withColumnRenamed("event_time_ts", "event_time")
+        .drop("event_time")  # Drop original string column to avoid ambiguity
+        .withColumnRenamed("event_time_ts", "event_time")  # Rename timestamp to event_time
+    )
+
+    # Safeguard: ensure exactly one event_time column exists before watermark
+    # Select all columns explicitly to guarantee uniqueness (event_time is now TimestampType)
+    parsed = parsed.select(
+        "txn_id",
+        "user_id",
+        "event_time",  # TimestampType column (converted from string)
+        "merchant_category",
+        "amount",
+        "country",
+        "city",
     )
 
     # Event-time watermark + txn_id dedupe
