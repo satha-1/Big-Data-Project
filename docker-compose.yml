@@ -7,7 +7,7 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
       ZOOKEEPER_4LW_COMMANDS_WHITELIST: ruok,srvr,stat,conf,mntr
     healthcheck:
-      test: ["CMD", "bash", "-lc", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "20"]
       interval: 10s
       timeout: 5s
       retries: 20
