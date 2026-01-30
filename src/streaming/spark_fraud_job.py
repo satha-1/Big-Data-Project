@@ -2,9 +2,9 @@ import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
+    approx_count_distinct,
     col,
     coalesce,
-    countDistinct,
     current_timestamp,
     date_format,
     from_json,
@@ -106,10 +106,11 @@ def main() -> None:
 
     # Rule B: IMPOSSIBLE_TRAVEL
     # 10-minute event-time window per user; if multiple distinct countries seen -> fraud
+    # Use approx_count_distinct (streaming-safe) instead of countDistinct
     events_with_win = events.withColumn("win10m", window(col("event_time"), "10 minutes"))
     suspect_windows = (
         events_with_win.groupBy(col("user_id"), col("win10m"))
-        .agg(countDistinct(col("country")).alias("distinct_countries"))
+        .agg(approx_count_distinct(col("country"), rsd=0.02).alias("distinct_countries"))
         .filter(col("distinct_countries") > lit(1))
         .select(col("user_id").alias("sw_user_id"), col("win10m").alias("sw_win10m"))
     )
