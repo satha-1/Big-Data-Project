@@ -101,8 +101,8 @@ def main() -> None:
     # Rule A: HIGH_SPEND
     is_high_spend = col("amount") > lit(5000.0)
 
-    # Rule B: IMPOSSIBLE_TRAVEL (10-min window; >1 distinct country)
-    # Extract window start/end as separate columns to avoid event-time column conflict
+    # Rule B: IMPOSSIBLE_TRAVEL - will be detected in foreachBatch to avoid streaming aggregation
+    # Add window columns for batch processing (keep them for fraud detection in foreachBatch)
     events_with_win = (
         events.withColumn("win10m", window(col("event_time"), "10 minutes"))
         .withColumn("win10m_start", col("win10m.start"))
@@ -110,62 +110,64 @@ def main() -> None:
         .drop("win10m")  # Drop the window struct to avoid event-time conflict
     )
 
-    # Add watermark using event_time to support append mode downstream
-    # The aggregation groups by window boundaries but uses event_time for watermark
-    suspect_windows = (
-        events_with_win.withWatermark("event_time", "15 minutes")
-        .groupBy(col("user_id"), col("win10m_start"), col("win10m_end"))
-        .agg(approx_count_distinct(col("country"), rsd=0.02).alias("distinct_countries"))
-        .filter(col("distinct_countries") > lit(1))
-        .select(
-            col("user_id").alias("sw_user_id"),
-            col("win10m_start").alias("sw_win10m_start"),
-            col("win10m_end").alias("sw_win10m_end"),
-        )
-    )
+    # Fraud events stream: all events (both fraud types detected in foreachBatch)
+    fraud_events = events_with_win
 
-    flagged = (
-        events_with_win.join(
-            suspect_windows,
-            (events_with_win.user_id == suspect_windows.sw_user_id)
-            & (events_with_win.win10m_start == suspect_windows.sw_win10m_start)
-            & (events_with_win.win10m_end == suspect_windows.sw_win10m_end),
-            how="left",
-        )
-        .withColumn("is_impossible_travel", col("sw_user_id").isNotNull())
-        .drop("sw_user_id", "sw_win10m_start", "sw_win10m_end")
-    )
+    # Valid events: non-high-spend (impossible travel filtered in foreachBatch)
+    valid_events = events_with_win.filter(~is_high_spend)
 
-    fraud_high_spend = (
-        flagged.filter(is_high_spend)
-        .drop("win10m_start", "win10m_end")
-        .withColumn("fraud_type", lit("HIGH_SPEND"))
-        .withColumn("detected_at", current_timestamp())
-    )
-
-    fraud_impossible_travel = (
-        flagged.filter(col("is_impossible_travel"))
-        .drop("win10m_start", "win10m_end")
-        .withColumn("fraud_type", lit("IMPOSSIBLE_TRAVEL"))
-        .withColumn("detected_at", current_timestamp())
-    )
-
-    # No streaming dropDuplicates here; we'll dedupe inside foreachBatch.
-    fraud_events = fraud_high_spend.unionByName(fraud_impossible_travel)
-
-    valid_events = (
-        flagged.filter(~is_high_spend & ~col("is_impossible_travel"))
-        .drop("win10m_start", "win10m_end")
-    )
-
+    # Valid events: non-high-spend (impossible travel will be filtered in batch if needed)
     validated_out = (
-        valid_events.withColumn("date", date_format(col("event_time"), "yyyy-MM-dd"))
+        valid_events.drop("win10m_start", "win10m_end")
+        .withColumn("date", date_format(col("event_time"), "yyyy-MM-dd"))
         .withColumn("hour", hour(col("event_time")))
     )
 
     def write_fraud_to_postgres(batch_df, batch_id: int) -> None:  # noqa: ANN001
+        # batch_df already has win10m_start and win10m_end columns
+        # Detect both HIGH_SPEND and IMPOSSIBLE_TRAVEL within this batch (batch operations, not streaming)
+        
+        # Rule A: HIGH_SPEND
+        fraud_high_spend_batch = (
+            batch_df.filter(col("amount") > lit(5000.0))
+            .drop("win10m_start", "win10m_end")
+            .withColumn("fraud_type", lit("HIGH_SPEND"))
+            .withColumn("detected_at", current_timestamp())
+        )
+
+        # Rule B: IMPOSSIBLE_TRAVEL (batch aggregation)
+        suspect_windows_batch = (
+            batch_df.groupBy("user_id", "win10m_start", "win10m_end")
+            .agg(approx_count_distinct("country", rsd=0.02).alias("distinct_countries"))
+            .filter(col("distinct_countries") > lit(1))
+            .select(
+                col("user_id").alias("sw_user_id"),
+                col("win10m_start").alias("sw_win10m_start"),
+                col("win10m_end").alias("sw_win10m_end"),
+            )
+        )
+
+        # Join to flag impossible travel events
+        flagged_batch = batch_df.join(
+            suspect_windows_batch,
+            (batch_df.user_id == suspect_windows_batch.sw_user_id)
+            & (batch_df.win10m_start == suspect_windows_batch.sw_win10m_start)
+            & (batch_df.win10m_end == suspect_windows_batch.sw_win10m_end),
+            how="left",
+        ).withColumn("is_impossible_travel", col("sw_user_id").isNotNull())
+
+        fraud_impossible_travel_batch = (
+            flagged_batch.filter(col("is_impossible_travel"))
+            .drop("win10m_start", "win10m_end", "sw_user_id", "sw_win10m_start", "sw_win10m_end", "is_impossible_travel")
+            .withColumn("fraud_type", lit("IMPOSSIBLE_TRAVEL"))
+            .withColumn("detected_at", current_timestamp())
+        )
+
+        # Union both fraud types
+        all_fraud = fraud_high_spend_batch.unionByName(fraud_impossible_travel_batch, allowMissingColumns=True)
+
         # Batch dedupe (no streaming state)
-        deduped = batch_df.dropDuplicates(["txn_id", "fraud_type"])
+        deduped = all_fraud.dropDuplicates(["txn_id", "fraud_type"])
 
         (
             deduped.select(

@@ -1,0 +1,5 @@
+v1
+{"path":"file:///data/warehouse/validated/date=2026-01-30/hour=12/part-00000-2a009d68-d2dd-4021-9221-286a0add40b2.c000.snappy.parquet","size":3166,"isDir":false,"modificationTime":1769776518020,"blockReplication":1,"blockSize":33554432,"action":"add"}
+{"path":"file:///data/warehouse/validated/date=2026-01-30/hour=12/part-00001-8ed01474-8e9b-499b-8429-0b65cca7f5b5.c000.snappy.parquet","size":3152,"isDir":false,"modificationTime":1769776518020,"blockReplication":1,"blockSize":33554432,"action":"add"}
+{"path":"file:///data/warehouse/validated/date=2026-01-30/hour=12/part-00002-12abfe39-17ba-4089-a8b4-a07a03748267.c000.snappy.parquet","size":3124,"isDir":false,"modificationTime":1769776518651,"blockReplication":1,"blockSize":33554432,"action":"add"}
+{"path":"file:///data/warehouse/validated/date=2026-01-30/hour=12/part-00003-56ab7b40-f3cc-428f-8086-28f72f21d4e1.c000.snappy.parquet","size":3343,"isDir":false,"modificationTime":1769776518667,"blockReplication":1,"blockSize":33554432,"action":"add"}
