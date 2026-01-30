@@ -1,0 +1,222 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "kafka-topics --bootstrap-server localhost:9092 --list 1>/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: |
+      set -e
+      echo "Creating Kafka topics..."
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions_raw --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --list
+      echo "Kafka topics ready."
+    restart: "no"
+
+  postgres:
+    image: postgres:16.2
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      POSTGRES_USER: ${POSTGRES_USER:-frauduser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraudpass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: src/streaming/Dockerfile
+    container_name: spark-master
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAW_TOPIC: ${RAW_TOPIC:-transactions_raw}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      POSTGRES_USER: ${POSTGRES_USER:-frauduser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraudpass}
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - ./data:/data
+      - ./src/streaming/spark_fraud_job.py:/opt/spark-apps/spark_fraud_job.py:ro
+    command:
+      - bash
+      - -c
+      - |
+        echo "Starting Spark master..."
+        ./bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080 &
+        echo "Waiting for Spark master to accept connections..."
+        for i in {1..60}; do
+          nc -z spark-master 7077 && break
+          sleep 2
+        done
+        echo "Submitting Spark Structured Streaming job..."
+        ./bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,org.apache.spark:spark-token-provider-kafka-0-10_2.12:3.4.0,org.postgresql:postgresql:42.7.3 \
+          /opt/spark-apps/spark_fraud_job.py
+
+  spark-worker:
+    image: apache/spark-py:3.4.0
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: 2
+    ports:
+      - "8082:8081"
+    command:
+      - bash
+      - -c
+      - ./bin/spark-class org.apache.spark.deploy.worker.Worker --webui-port 8081 spark://spark-master:7077
+
+  producer:
+    build:
+      context: .
+      dockerfile: src/producer/Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAW_TOPIC: ${RAW_TOPIC:-transactions_raw}
+      TXNS_PER_SEC: ${TXNS_PER_SEC:-5}
+      FRAUD_EVERY_N: ${FRAUD_EVERY_N:-20}
+      PRODUCER_SEED: ${PRODUCER_SEED:-42}
+    restart: unless-stopped
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: src/airflow/Dockerfile
+    container_name: airflow-webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES:-False}
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-frauduser}:${POSTGRES_PASSWORD:-fraudpass}@${POSTGRES_HOST:-postgres}:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-please-change-me}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      POSTGRES_USER: ${POSTGRES_USER:-frauduser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraudpass}
+      DATA_DIR: /opt/airflow/data
+      REPORTS_DIR: /opt/airflow/reports
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./src/airflow/dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./reports:/opt/airflow/reports
+    command:
+      - bash
+      - -lc
+      - |
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username "$${AIRFLOW_ADMIN_USER}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin \
+          --lastname User \
+          --email admin@example.com || true
+        exec airflow webserver
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: src/airflow/Dockerfile
+    container_name: airflow-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES:-False}
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-frauduser}:${POSTGRES_PASSWORD:-fraudpass}@${POSTGRES_HOST:-postgres}:5432/airflow
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      POSTGRES_USER: ${POSTGRES_USER:-frauduser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraudpass}
+      DATA_DIR: /opt/airflow/data
+      REPORTS_DIR: /opt/airflow/reports
+    volumes:
+      - ./src/airflow/dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./reports:/opt/airflow/reports
+    command:
+      - bash
+      - -lc
+      - |
+        airflow db migrate
+        exec airflow scheduler
+
+volumes:
+  postgres_data:
+
